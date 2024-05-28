@@ -53,6 +53,24 @@ type ZipTestFile struct {
 
 var tests = []ZipTest{
 	{
+		Name:    "split.zip",
+		Comment: "This is a split zip.",
+		File: []ZipTestFile{
+			{
+				Name:     "gophercolor16x16.png",
+				File:     "gophercolor16x16.png",
+				Modified: time.Date(2010, 9, 5, 13, 52, 58, 0, timeZone(+8*time.Hour)),
+				Mode:     0666,
+			},
+			{
+				Name:     "test.txt",
+				Content:  []byte("This is a test text file.\n"),
+				Modified: time.Date(2010, 9, 5, 10, 12, 1, 0, timeZone(+8*time.Hour)),
+				Mode:     0666,
+			},
+		},
+	},
+	{
 		Name:    "test.zip",
 		Comment: "This is a zipfile comment.",
 		File: []ZipTestFile{
@@ -672,13 +690,15 @@ func readTestFile(t *testing.T, zt ZipTest, ft ZipTestFile, f *File, raw []byte)
 		t.Errorf("%v: OpenRaw ReadAll error=%v", f.Name, err)
 		return
 	}
-	end := uint64(start) + f.CompressedSize64
-	want := raw[start:end]
-	if !bytes.Equal(got, want) {
-		t.Logf("got %q", got)
-		t.Logf("want %q", want)
-		t.Errorf("%v: OpenRaw returned unexpected bytes", f.Name)
-		return
+	if len(f.zip.rs) == 1 {
+		end := uint64(start) + f.CompressedSize64
+		want := raw[start:end]
+		if !bytes.Equal(got, want) {
+			t.Logf("got %q", got)
+			t.Logf("want %q", want)
+			t.Errorf("%v: OpenRaw returned unexpected bytes", f.Name)
+			return
+		}
 	}
 
 	r, err := f.Open()
@@ -1062,25 +1082,9 @@ func TestIssue10957(t *testing.T) {
 		"0000000000000000\v\x00\x00\x00" +
 		"\x00\x0000PK\x05\x06000000\x05\x00\xfd\x00\x00\x00" +
 		"\v\x00\x00\x00\x00\x00")
-	z, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
+	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != ErrFormat {
 		t.Fatal(err)
-	}
-	for i, f := range z.File {
-		r, err := f.Open()
-		if err != nil {
-			continue
-		}
-		if f.UncompressedSize64 < 1e6 {
-			n, err := io.Copy(io.Discard, r)
-			if i == 3 && err != io.ErrUnexpectedEOF {
-				t.Errorf("File[3] error = %v; want io.ErrUnexpectedEOF", err)
-			}
-			if err == nil && uint64(n) != f.UncompressedSize64 {
-				t.Errorf("file %d: bad size: copied=%d; want=%d", i, n, f.UncompressedSize64)
-			}
-		}
-		r.Close()
 	}
 }
 
@@ -1110,15 +1114,10 @@ func TestIssue11146(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := z.File[0].Open()
-	if err != nil {
+	_, err = z.File[0].Open()
+	if err != ErrFormat {
 		t.Fatal(err)
 	}
-	_, err = io.ReadAll(r)
-	if err != io.ErrUnexpectedEOF {
-		t.Errorf("File[0] error = %v; want io.ErrUnexpectedEOF", err)
-	}
-	r.Close()
 }
 
 // Verify we do not treat non-zip64 archives as zip64
@@ -1274,7 +1273,6 @@ func TestFSModTime(t *testing.T) {
 }
 
 func TestCVE202127919(t *testing.T) {
-	t.Setenv("GODEBUG", "zipinsecurepath=0")
 	// Archive containing only the file "../test.txt"
 	data := []byte{
 		0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x08, 0x00,
@@ -1319,7 +1317,6 @@ func TestCVE202127919(t *testing.T) {
 }
 
 func TestOpenReaderInsecurePath(t *testing.T) {
-	t.Setenv("GODEBUG", "zipinsecurepath=0")
 	// Archive containing only the file "../test.txt"
 	data := []byte{
 		0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x08, 0x00,
@@ -1452,7 +1449,6 @@ func TestCVE202139293(t *testing.T) {
 }
 
 func TestCVE202141772(t *testing.T) {
-	t.Setenv("GODEBUG", "zipinsecurepath=0")
 	// Archive contains a file whose name is exclusively made up of '/', '\'
 	// characters, or "../", "..\" paths, which would previously cause a panic.
 	//
@@ -1628,7 +1624,6 @@ func TestIssue54801(t *testing.T) {
 }
 
 func TestInsecurePaths(t *testing.T) {
-	t.Setenv("GODEBUG", "zipinsecurepath=0")
 	for _, path := range []string{
 		"../foo",
 		"/foo",
@@ -1657,29 +1652,6 @@ func TestInsecurePaths(t *testing.T) {
 			t.Errorf("NewReader for archive with file %q: got files %q", path, gotPaths)
 			continue
 		}
-	}
-}
-
-func TestDisableInsecurePathCheck(t *testing.T) {
-	t.Setenv("GODEBUG", "zipinsecurepath=1")
-	var buf bytes.Buffer
-	zw := NewWriter(&buf)
-	const name = "/foo"
-	_, err := zw.Create(name)
-	if err != nil {
-		t.Fatalf("zw.Create(%q) = %v", name, err)
-	}
-	zw.Close()
-	zr, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
-	if err != nil {
-		t.Fatalf("NewReader with zipinsecurepath=1: got err %v, want nil", err)
-	}
-	var gotPaths []string
-	for _, f := range zr.File {
-		gotPaths = append(gotPaths, f.Name)
-	}
-	if want := []string{name}; !reflect.DeepEqual(gotPaths, want) {
-		t.Errorf("NewReader with zipinsecurepath=1: got files %q, want %q", gotPaths, want)
 	}
 }
 

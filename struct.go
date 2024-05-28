@@ -156,6 +156,9 @@ type FileHeader struct {
 	// UncompressedSize64 is the uncompressed size of the file in bytes.
 	UncompressedSize64 uint64
 
+	// the number of the disk on which this file exists
+	DiskNbr uint16
+
 	Extra         []byte
 	ExternalAttrs uint32 // Meaning depends on CreatorVersion
 }

@@ -8,12 +8,14 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -29,10 +31,14 @@ var (
 
 // A Reader serves content from a ZIP archive.
 type Reader struct {
-	r             io.ReaderAt
 	File          []*File
 	Comment       string
 	decompressors map[uint16]Decompressor
+
+	name  string
+	files []*os.File    // additional splitted zip files ("foo.z01", ... "foo.zXX", excluding "foo.zip").
+	sizes []int64       // sizes of all splitted zip files (including foo.zip).
+	rs    []io.ReaderAt // readers of all splitted zip files (including foo.zip).
 
 	// Some JAR files are zip files with a prefix that is a bash script.
 	// The baseOffset field is the start of the zip file proper.
@@ -56,8 +62,7 @@ type ReadCloser struct {
 type File struct {
 	FileHeader
 	zip          *Reader
-	zipr         io.ReaderAt
-	headerOffset int64 // includes overall ZIP archive baseOffset
+	HeaderOffset int64 // includes overall ZIP archive baseOffset
 	zip64        bool  // zip64 extended information extra field presence
 }
 
@@ -81,8 +86,12 @@ func OpenReader(name string) (*ReadCloser, error) {
 		return nil, err
 	}
 	r := new(ReadCloser)
+	r.name = name
 	if err = r.init(f, fi.Size()); err != nil && err != ErrInsecurePath {
 		f.Close()
+		for _, f := range r.files {
+			f.Close()
+		}
 		return nil, err
 	}
 	r.f = f
@@ -116,7 +125,33 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 	if err != nil {
 		return err
 	}
-	r.r = rdr
+	if end.dirDiskNbr > 0 {
+		if r.name == "" {
+			return ErrFormat
+		}
+		ext := filepath.Ext(r.name)
+		if ext != ".zip" {
+			return ErrFormat
+		}
+		base := r.name[:len(r.name)-len(ext)]
+		for i := uint32(0); i < end.dirDiskNbr; i++ {
+			name := base + fmt.Sprintf(".z%02d", i+1)
+			file, err := os.Open(name)
+			if err != nil {
+				return fmt.Errorf("failed to open split zip volume %q: %w", name, err)
+			}
+			fi, err := file.Stat()
+			if err != nil {
+				file.Close()
+				return fmt.Errorf("failed to read split zip volume info %q: %w", name, err)
+			}
+			r.sizes = append(r.sizes, fi.Size())
+			r.files = append(r.files, file)
+			r.rs = append(r.rs, file)
+		}
+	}
+	r.rs = append(r.rs, rdr)
+	r.sizes = append(r.sizes, size)
 	r.baseOffset = baseOffset
 	// Since the number of directory records is not validated, it is not
 	// safe to preallocate r.File without first checking that the specified
@@ -124,12 +159,18 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 	// indicate it contains up to 1 << 128 - 1 files. Since each file has a
 	// header which will be _at least_ 30 bytes we can safely preallocate
 	// if (data size / 30) >= end.directoryRecords.
-	if end.directorySize < uint64(size) && (uint64(size)-end.directorySize)/30 >= end.directoryRecords {
+	totalSize := r.TotalSize()
+	if end.directorySize < uint64(totalSize) && (uint64(totalSize)-end.directorySize)/30 >= end.directoryRecords {
 		r.File = make([]*File, 0, end.directoryRecords)
 	}
 	r.Comment = end.comment
-	rs := io.NewSectionReader(rdr, 0, size)
-	if _, err = rs.Seek(r.baseOffset+int64(end.directoryOffset), io.SeekStart); err != nil {
+	rs := io.NewSectionReader(r, 0, totalSize)
+	directoryOffset := int64(0)
+	for i := 0; i < int(end.dirDiskNbr); i++ {
+		directoryOffset += r.sizes[i]
+	}
+	directoryOffset += +int64(end.directoryOffset)
+	if _, err = rs.Seek(r.baseOffset+directoryOffset, io.SeekStart); err != nil {
 		return err
 	}
 	buf := bufio.NewReader(rs)
@@ -139,7 +180,7 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 	// a bad one, and then only report an ErrFormat or UnexpectedEOF if
 	// the file count modulo 65536 is incorrect.
 	for {
-		f := &File{zip: r, zipr: rdr}
+		f := &File{zip: r}
 		err = readDirectoryHeader(f, buf)
 		if err == ErrFormat || err == io.ErrUnexpectedEOF {
 			break
@@ -147,7 +188,7 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 		if err != nil {
 			return err
 		}
-		f.headerOffset += r.baseOffset
+		f.HeaderOffset += r.baseOffset
 		r.File = append(r.File, f)
 	}
 	if uint16(len(r.File)) != uint16(end.directoryRecords) { // only compare 16 bits here
@@ -155,7 +196,26 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 		// the wrong number of directory entries.
 		return err
 	}
+	for _, f := range r.File {
+		if f.Name == "" {
+			// Zip permits an empty file name field.
+			continue
+		}
+		// The zip specification states that names must use forward slashes,
+		// so consider any backslashes in the name insecure.
+		if !filepath.IsLocal(f.Name) || strings.Contains(f.Name, `\`) {
+			return ErrInsecurePath
+		}
+	}
 	return nil
+}
+
+// Total size of all splitted volumes
+func (r *Reader) TotalSize() (size int64) {
+	for _, s := range r.sizes {
+		size += s
+	}
+	return size
 }
 
 // RegisterDecompressor registers or overrides a custom decompressor for a
@@ -178,7 +238,50 @@ func (r *Reader) decompressor(method uint16) Decompressor {
 
 // Close closes the Zip file, rendering it unusable for I/O.
 func (rc *ReadCloser) Close() error {
+	for _, f := range rc.files {
+		f.Close()
+	}
 	return rc.f.Close()
+}
+
+func (r *Reader) ReadAt(p []byte, off int64) (n int, err error) {
+	for i := 0; i < len(r.rs); i++ {
+		remain := r.sizes[i] // remain bytes in current split zip volume
+		if off > 0 {
+			if off >= remain {
+				off -= remain
+				continue
+			} else {
+				remain -= off
+			}
+		}
+		readlen := int(min(remain, int64(len(p)-n)))
+		var readed int
+		readed, err = r.rs[i].ReadAt(p[n:n+readlen], off)
+		n += readed
+		if readed != readlen {
+			return n, err
+		}
+		off = 0
+	}
+	if n != len(p) {
+		return n, ErrFormat
+	}
+	return
+}
+
+// Read the file in .zip from the file HeaderOffset. Supporting splitted zips.
+func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
+	if int(f.DiskNbr) >= len(f.zip.rs) {
+		return 0, ErrFormat
+	}
+	offset := int64(0)
+	for i := uint16(0); i < f.DiskNbr; i++ {
+		offset += f.zip.sizes[i]
+	}
+	offset += f.HeaderOffset + off
+	n, err = f.zip.ReadAt(p, offset)
+	return
 }
 
 // DataOffset returns the offset of the file's possibly-compressed
@@ -191,7 +294,7 @@ func (f *File) DataOffset() (offset int64, err error) {
 	if err != nil {
 		return
 	}
-	return f.headerOffset + bodyOffset, nil
+	return f.HeaderOffset + bodyOffset, nil
 }
 
 // Open returns a [ReadCloser] that provides access to the [File]'s contents.
@@ -218,7 +321,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 		}
 	}
 	size := int64(f.CompressedSize64)
-	r := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
+	r := io.NewSectionReader(f, bodyOffset, size)
 	dcomp := f.zip.decompressor(f.Method)
 	if dcomp == nil {
 		return nil, ErrAlgorithm
@@ -226,7 +329,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 	var rc io.ReadCloser = dcomp(r)
 	var desr io.Reader
 	if f.hasDataDescriptor() {
-		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, dataDescriptorLen)
+		desr = io.NewSectionReader(f, bodyOffset+size, dataDescriptorLen)
 	}
 	rc = &checksumReader{
 		rc:   rc,
@@ -244,7 +347,7 @@ func (f *File) OpenRaw() (io.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, int64(f.CompressedSize64))
+	r := io.NewSectionReader(f, bodyOffset, int64(f.CompressedSize64))
 	return r, nil
 }
 
@@ -319,7 +422,7 @@ func (r *checksumReader) Close() error { return r.rc.Close() }
 // and returns the file body offset.
 func (f *File) findBodyOffset() (int64, error) {
 	var buf [fileHeaderLen]byte
-	if _, err := f.zipr.ReadAt(buf[:], f.headerOffset); err != nil {
+	if _, err := f.ReadAt(buf[:], 0); err != nil {
 		return 0, err
 	}
 	b := readBuf(buf[:])
@@ -358,9 +461,10 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	filenameLen := int(b.uint16())
 	extraLen := int(b.uint16())
 	commentLen := int(b.uint16())
-	b = b[4:] // skipped start disk number and internal attributes (2x uint16)
+	f.DiskNbr = b.uint16()
+	b = b[2:] // skipped internal attributes (uint16)
 	f.ExternalAttrs = b.uint32()
-	f.headerOffset = int64(b.uint32())
+	f.HeaderOffset = int64(b.uint32())
 	d := make([]byte, filenameLen+extraLen+commentLen)
 	if _, err := io.ReadFull(r, d); err != nil {
 		return err
@@ -389,7 +493,7 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 
 	needUSize := f.UncompressedSize == ^uint32(0)
 	needCSize := f.CompressedSize == ^uint32(0)
-	needHeaderOffset := f.headerOffset == int64(^uint32(0))
+	needHeaderOffset := f.HeaderOffset == int64(^uint32(0))
 
 	// Best effort to find what we need.
 	// Other zip authors might not even follow the basic format,
@@ -431,7 +535,7 @@ parseExtras:
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
-				f.headerOffset = int64(fieldBuf.uint64())
+				f.HeaderOffset = int64(fieldBuf.uint64())
 			}
 		case ntfsExtraID:
 			if len(fieldBuf) < 4 {
@@ -584,6 +688,9 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 		return nil, 0, errors.New("zip: invalid comment length")
 	}
 	d.comment = string(b[:l])
+	if d.dirDiskNbr > d.diskNbr {
+		return d, 0, ErrFormat
+	}
 
 	// These values mean that the file can be a zip64 file
 	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
@@ -600,6 +707,10 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 	maxInt64 := uint64(1<<63 - 1)
 	if d.directorySize > maxInt64 || d.directoryOffset > maxInt64 {
 		return nil, 0, ErrFormat
+	}
+
+	if d.dirDiskNbr != d.diskNbr {
+		return d, 0, nil
 	}
 
 	baseOffset = directoryEndOffset - int64(d.directorySize) - int64(d.directoryOffset)
