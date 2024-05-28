@@ -262,6 +262,9 @@ func (r *Reader) ReadAt(p []byte, off int64) (n int, err error) {
 		if readed != readlen {
 			return n, err
 		}
+		if n == len(p) {
+			break
+		}
 		off = 0
 	}
 	if n != len(p) {
