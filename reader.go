@@ -201,9 +201,7 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 			// Zip permits an empty file name field.
 			continue
 		}
-		// The zip specification states that names must use forward slashes,
-		// so consider any backslashes in the name insecure.
-		if !filepath.IsLocal(f.Name) || strings.Contains(f.Name, `\`) {
+		if !filepath.IsLocal(f.Name) {
 			return ErrInsecurePath
 		}
 	}
