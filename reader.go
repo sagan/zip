@@ -13,18 +13,26 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 var (
-	ErrFormat    = errors.New("zip: not a valid zip file")
-	ErrAlgorithm = errors.New("zip: unsupported compression algorithm")
-	ErrChecksum  = errors.New("zip: checksum error")
+	ErrFormat       = errors.New("zip: not a valid zip file")
+	ErrAlgorithm    = errors.New("zip: unsupported compression algorithm")
+	ErrChecksum     = errors.New("zip: checksum error")
+	ErrInsecurePath = errors.New("zip: insecure file path")
 )
 
 type Reader struct {
-	r       io.ReaderAt
 	File    []*File
 	Comment string
+
+	name  string
+	files []*os.File    // additional splitted zip files ("foo.z01", ... "foo.zXX", excluding "foo.zip").
+	sizes []int64       // sizes of all splitted zip files (including foo.zip).
+	rs    []io.ReaderAt // readers of all splitted zip files (including foo.zip).
+
+	baseOffset int64
 }
 
 type ReadCloser struct {
@@ -34,7 +42,7 @@ type ReadCloser struct {
 
 type File struct {
 	FileHeader
-	zipr         io.ReaderAt
+	zip          *Reader
 	zipsize      int64
 	headerOffset int64
 }
@@ -44,6 +52,14 @@ func (f *File) hasDataDescriptor() bool {
 }
 
 // OpenReader will open the Zip file specified by name and return a ReadCloser.
+//
+// If any file inside the archive uses a non-local name
+// (as defined by [filepath.IsLocal]) or a name containing backslashes
+// and the GODEBUG environment variable contains `zipinsecurepath=0`,
+// OpenReader returns the reader with an ErrInsecurePath error.
+// A future version of Go may introduce this behavior by default.
+// Programs that want to accept non-local names can ignore
+// the ErrInsecurePath error and use the returned reader.
 func OpenReader(name string) (*ReadCloser, error) {
 	f, err := os.Open(name)
 	if err != nil {
@@ -55,37 +71,93 @@ func OpenReader(name string) (*ReadCloser, error) {
 		return nil, err
 	}
 	r := new(ReadCloser)
-	if err := r.init(f, fi.Size()); err != nil {
+	r.name = name
+	if err := r.init(f, fi.Size()); err != nil && err != ErrInsecurePath {
 		f.Close()
+		for _, f := range r.files {
+			f.Close()
+		}
 		return nil, err
 	}
 	r.f = f
 	return r, nil
 }
 
-// NewReader returns a new Reader reading from r, which is assumed to
+// NewReader returns a new [Reader] reading from r, which is assumed to
 // have the given size in bytes.
+//
+// If any file inside the archive uses a non-local name
+// (as defined by [filepath.IsLocal]) or a name containing backslashes
+// and the GODEBUG environment variable contains `zipinsecurepath=0`,
+// NewReader returns the reader with an [ErrInsecurePath] error.
+// A future version of Go may introduce this behavior by default.
+// Programs that want to accept non-local names can ignore
+// the [ErrInsecurePath] error and use the returned reader.
 func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
 	zr := new(Reader)
-	if err := zr.init(r, size); err != nil {
+	if err := zr.init(r, size); err != nil && err != ErrInsecurePath {
 		return nil, err
 	}
 	return zr, nil
 }
 
 func (z *Reader) init(r io.ReaderAt, size int64) error {
-	end, err := readDirectoryEnd(r, size)
+	end, baseOffset, err := readDirectoryEnd(r, size)
 	if err != nil {
 		return err
 	}
-	if end.directoryRecords > uint64(size)/fileHeaderLen {
+	if end.dirDiskNbr > 0 {
+		if z.name == "" {
+			return ErrFormat
+		}
+		ext := filepath.Ext(z.name)
+		if ext != ".zip" {
+			return ErrFormat
+		}
+		base := z.name[:len(z.name)-len(ext)]
+		for i := uint32(0); i < end.dirDiskNbr; i++ {
+			name := base + fmt.Sprintf(".z%02d", i+1)
+			file, err := os.Open(name)
+			if err != nil {
+				return fmt.Errorf("failed to open split zip volume %q: %w", name, err)
+			}
+			fi, err := file.Stat()
+			if err != nil {
+				file.Close()
+				return fmt.Errorf("failed to read split zip volume info %q: %w", name, err)
+			}
+			z.sizes = append(z.sizes, fi.Size())
+			z.files = append(z.files, file)
+			z.rs = append(z.rs, file)
+		}
+	}
+	z.rs = append(z.rs, r)
+	z.sizes = append(z.sizes, size)
+	z.baseOffset = baseOffset
+
+	totalSize := z.TotalSize()
+	if end.directoryRecords > uint64(totalSize)/fileHeaderLen {
 		return fmt.Errorf("archive/zip: TOC declares impossible %d files in %d byte zip", end.directoryRecords, size)
 	}
-	z.r = r
-	z.File = make([]*File, 0, end.directoryRecords)
+	// r.File = make([]*File, 0, end.directoryRecords)
+	// Since the number of directory records is not validated, it is not
+	// safe to preallocate r.File without first checking that the specified
+	// number of files is reasonable, since a malformed archive may
+	// indicate it contains up to 1 << 128 - 1 files. Since each file has a
+	// header which will be _at least_ 30 bytes we can safely preallocate
+	// if (data size / 30) >= end.directoryRecords.
+	if end.directorySize < uint64(totalSize) && (uint64(totalSize)-end.directorySize)/30 >= end.directoryRecords {
+		z.File = make([]*File, 0, end.directoryRecords)
+	}
+
 	z.Comment = end.comment
-	rs := io.NewSectionReader(r, 0, size)
-	if _, err = rs.Seek(int64(end.directoryOffset), os.SEEK_SET); err != nil {
+	rs := io.NewSectionReader(z, 0, totalSize)
+	directoryOffset := int64(0)
+	for i := 0; i < int(end.dirDiskNbr); i++ {
+		directoryOffset += z.sizes[i]
+	}
+	directoryOffset += +int64(end.directoryOffset)
+	if _, err = rs.Seek(z.baseOffset+directoryOffset, io.SeekStart); err != nil {
 		return err
 	}
 	buf := bufio.NewReader(rs)
@@ -95,7 +167,7 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 	// a bad one, and then only report a ErrFormat or UnexpectedEOF if
 	// the file count modulo 65536 is incorrect.
 	for {
-		f := &File{zipr: r, zipsize: size}
+		f := &File{zip: z, zipsize: size}
 		err = readDirectoryHeader(f, buf)
 		if err == ErrFormat || err == io.ErrUnexpectedEOF {
 			break
@@ -110,12 +182,75 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 		// the wrong number of directory entries.
 		return err
 	}
+	for _, f := range z.File {
+		if f.Name == "" {
+			// Zip permits an empty file name field.
+			continue
+		}
+		if !filepath.IsLocal(f.Name) {
+			return ErrInsecurePath
+		}
+	}
 	return nil
+}
+
+// Total size of all splitted volumes
+func (r *Reader) TotalSize() (size int64) {
+	for _, s := range r.sizes {
+		size += s
+	}
+	return size
 }
 
 // Close closes the Zip file, rendering it unusable for I/O.
 func (rc *ReadCloser) Close() error {
+	for _, f := range rc.files {
+		f.Close()
+	}
 	return rc.f.Close()
+}
+
+func (r *Reader) ReadAt(p []byte, off int64) (n int, err error) {
+	for i := 0; i < len(r.rs); i++ {
+		remain := r.sizes[i] // remain bytes in current split zip volume
+		if off > 0 {
+			if off >= remain {
+				off -= remain
+				continue
+			} else {
+				remain -= off
+			}
+		}
+		readlen := int(min(remain, int64(len(p)-n)))
+		var readed int
+		readed, err = r.rs[i].ReadAt(p[n:n+readlen], off)
+		n += readed
+		if readed != readlen {
+			return n, err
+		}
+		if n == len(p) {
+			break
+		}
+		off = 0
+	}
+	if n != len(p) {
+		return n, ErrFormat
+	}
+	return
+}
+
+// Read the file in .zip from the file HeaderOffset. Supporting splitted zips.
+func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
+	if int(f.DiskNbr) >= len(f.zip.rs) {
+		return 0, ErrFormat
+	}
+	offset := int64(0)
+	for i := uint16(0); i < f.DiskNbr; i++ {
+		offset += f.zip.sizes[i]
+	}
+	offset += f.headerOffset + off
+	n, err = f.zip.ReadAt(p, offset)
+	return
 }
 
 // DataOffset returns the offset of the file's possibly-compressed
@@ -142,10 +277,9 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 	// and auth code lengths
 	size := int64(f.CompressedSize64)
 	var r io.Reader
-	rr := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
+	rr := io.NewSectionReader(f, bodyOffset, size)
 	// check for encryption
 	if f.IsEncrypted() {
-
 		if f.ae == 0 {
 			if r, err = ZipCryptoDecryptor(rr, f.password()); err != nil {
 				return
@@ -168,7 +302,7 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 	}
 	var desr io.Reader
 	if f.hasDataDescriptor() {
-		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, dataDescriptorLen)
+		desr = io.NewSectionReader(f, bodyOffset+size, dataDescriptorLen)
 	}
 	rc = &checksumReader{
 		rc:   rc,
@@ -177,6 +311,17 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 		desr: desr,
 	}
 	return
+}
+
+// OpenRaw returns a [Reader] that provides access to the [File]'s contents without
+// decompression.
+func (f *File) OpenRaw() (io.Reader, error) {
+	bodyOffset, err := f.findBodyOffset()
+	if err != nil {
+		return nil, err
+	}
+	r := io.NewSectionReader(f, bodyOffset, int64(f.CompressedSize64))
+	return r, nil
 }
 
 type checksumReader struct {
@@ -231,7 +376,7 @@ func (r *checksumReader) Close() error { return r.rc.Close() }
 // and returns the file body offset.
 func (f *File) findBodyOffset() (int64, error) {
 	var buf [fileHeaderLen]byte
-	if _, err := f.zipr.ReadAt(buf[:], f.headerOffset); err != nil {
+	if _, err := f.ReadAt(buf[:], 0); err != nil {
 		return 0, err
 	}
 	b := readBuf(buf[:])
@@ -270,7 +415,8 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	filenameLen := int(b.uint16())
 	extraLen := int(b.uint16())
 	commentLen := int(b.uint16())
-	b = b[4:] // skipped start disk number and internal attributes (2x uint16)
+	f.DiskNbr = b.uint16()
+	b = b[2:] // skipped internal attributes (uint16)
 	f.ExternalAttrs = b.uint32()
 	f.headerOffset = int64(b.uint32())
 	d := make([]byte, filenameLen+extraLen+commentLen)
@@ -280,6 +426,24 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	f.Name = string(d[:filenameLen])
 	f.Extra = d[filenameLen : filenameLen+extraLen]
 	f.Comment = string(d[filenameLen+extraLen:])
+
+	// Determine the character encoding.
+	utf8Valid1, utf8Require1 := detectUTF8(f.Name)
+	utf8Valid2, utf8Require2 := detectUTF8(f.Comment)
+	switch {
+	case !utf8Valid1 || !utf8Valid2:
+		// Name and Comment definitely not UTF-8.
+		f.NonUTF8 = true
+	case !utf8Require1 && !utf8Require2:
+		// Name and Comment use only single-byte runes that overlap with UTF-8.
+		f.NonUTF8 = false
+	default:
+		// Might be UTF-8, might be some other encoding; preserve existing flag.
+		// Some ZIP writers use UTF-8 encoding without setting the UTF-8 flag.
+		// Since it is impossible to always distinguish valid UTF-8 from some
+		// other encoding (e.g., GBK or Shift-JIS), we trust the flag.
+		f.NonUTF8 = f.Flags&0x800 == 0
+	}
 
 	if len(f.Extra) > 0 {
 		b := readBuf(f.Extra)
@@ -367,7 +531,7 @@ func readDataDescriptor(r io.Reader, f *File) error {
 	return nil
 }
 
-func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, err error) {
+func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset int64, err error) {
 	// look for directoryEndSignature in the last 1k, then in the last 65k
 	var buf []byte
 	var directoryEndOffset int64
@@ -377,7 +541,7 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, err error) 
 		}
 		buf = make([]byte, int(bLen))
 		if _, err := r.ReadAt(buf, size-bLen); err != nil && err != io.EOF {
-			return nil, err
+			return nil, 0, err
 		}
 		if p := findSignatureInBlock(buf); p >= 0 {
 			buf = buf[p:]
@@ -385,7 +549,7 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, err error) 
 			break
 		}
 		if i == 1 || bLen == size {
-			return nil, ErrFormat
+			return nil, 0, ErrFormat
 		}
 	}
 
@@ -402,23 +566,55 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, err error) 
 	}
 	l := int(d.commentLen)
 	if l > len(b) {
-		return nil, errors.New("zip: invalid comment length")
+		return nil, 0, errors.New("zip: invalid comment length")
 	}
 	d.comment = string(b[:l])
+	if d.dirDiskNbr > d.diskNbr {
+		return d, 0, ErrFormat
+	}
 
-	p, err := findDirectory64End(r, directoryEndOffset)
-	if err == nil && p >= 0 {
-		err = readDirectory64End(r, p, d)
+	// These values mean that the file can be a zip64 file
+	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
+		p, err := findDirectory64End(r, directoryEndOffset)
+		if err == nil && p >= 0 {
+			directoryEndOffset = p
+			err = readDirectory64End(r, p, d)
+		}
+		if err != nil {
+			return nil, 0, err
+		}
 	}
-	if err != nil {
-		return nil, err
+
+	maxInt64 := uint64(1<<63 - 1)
+	if d.directorySize > maxInt64 || d.directoryOffset > maxInt64 {
+		return nil, 0, ErrFormat
 	}
+
+	if d.dirDiskNbr != d.diskNbr {
+		return d, 0, nil
+	}
+
+	baseOffset = directoryEndOffset - int64(d.directorySize) - int64(d.directoryOffset)
 
 	// Make sure directoryOffset points to somewhere in our file.
-	if o := int64(d.directoryOffset); o < 0 || o >= size {
-		return nil, ErrFormat
+	if o := baseOffset + int64(d.directoryOffset); o < 0 || o >= size {
+		return nil, 0, ErrFormat
 	}
-	return d, nil
+
+	// If the directory end data tells us to use a non-zero baseOffset,
+	// but we would find a valid directory entry if we assume that the
+	// baseOffset is 0, then just use a baseOffset of 0.
+	// We've seen files in which the directory end data gives us
+	// an incorrect baseOffset.
+	if baseOffset > 0 {
+		off := int64(d.directoryOffset)
+		rs := io.NewSectionReader(r, off, size-off)
+		if readDirectoryHeader(&File{}, rs) == nil {
+			baseOffset = 0
+		}
+	}
+
+	return d, baseOffset, nil
 }
 
 // findDirectory64End tries to read the zip64 locator just before the

@@ -1,3 +1,13 @@
+This is a fork of the [yeka/zip](https://github.com/yeka/zip) to add support for reading split zip files (.z01 + ... + .zXX + .zip).
+
+Notes
+
+- Only reading of split zip files is implemented. Writing is NOT supported.
+- To open a split zip file, use `OpenReader("foo.zip")`. It will open other volumes (.z01 ... .zXX) internally.
+- If any file inside the archive uses a non-local name, it returns opened zip file along with `ErrInsecurePath` error. It's the same behavior as Go standard [archive/zip](https://pkg.go.dev/archive/zip) package. However, backslashes in the name are no longer considered as insecure path.
+
+# yeka/zip
+
 This fork add support for Standard Zip Encryption.
 
 The work is based on https://github.com/alexmullins/zip
